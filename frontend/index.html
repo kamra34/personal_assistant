@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Meeting Assistant MVP</title>
+  <style>
+    :root {
+      --bg: #f6f7fb;
+      --card: #ffffff;
+      --ink: #1b2330;
+      --subtle: #5a6a85;
+      --accent: #0f766e;
+      --border: #dbe2ef;
+    }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      color: var(--ink);
+      background: linear-gradient(180deg, #eef3fb 0%, #f9fbff 100%);
+    }
+    .wrap {
+      max-width: 980px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      display: grid;
+      gap: 1rem;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 0.8rem;
+    }
+    label {
+      display: block;
+      font-size: 0.85rem;
+      color: var(--subtle);
+      margin-bottom: 0.3rem;
+    }
+    input, select, textarea, button {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.6rem;
+      font-size: 0.95rem;
+      box-sizing: border-box;
+    }
+    textarea {
+      min-height: 86px;
+      resize: vertical;
+    }
+    button {
+      border: none;
+      background: var(--accent);
+      color: white;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .out {
+      white-space: pre-wrap;
+      line-height: 1.4;
+      min-height: 120px;
+      font-size: 0.96rem;
+    }
+    .status {
+      font-size: 0.85rem;
+      color: var(--subtle);
+    }
+    @media (max-width: 840px) {
+      .row {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h2>Meeting Assistant MVP</h2>
+      <div class="row">
+        <div>
+          <label for="session">Session ID</label>
+          <input id="session" value="default-room" />
+        </div>
+        <div>
+          <label for="provider">Provider</label>
+          <select id="provider">
+            <option value="mock">mock</option>
+            <option value="openai">openai</option>
+            <option value="anthropic">anthropic</option>
+          </select>
+        </div>
+        <div>
+          <label for="model">Model</label>
+          <input id="model" value="gpt-4o-mini" />
+        </div>
+        <div>
+          <label for="historyMode">History mode</label>
+          <select id="historyMode">
+            <option value="focused">focused (latest-first)</option>
+            <option value="full">full conversation</option>
+            <option value="stateless">stateless (no history)</option>
+          </select>
+        </div>
+        <div style="display: flex; align-items: end;">
+          <button id="connect">Connect</button>
+        </div>
+      </div>
+      <div style="margin-top: 0.8rem;">
+        <label for="context">Optional context</label>
+        <textarea id="context" placeholder="Project, role, agenda, constraints..."></textarea>
+      </div>
+      <p class="status" id="status">Not connected.</p>
+    </div>
+
+    <div class="card">
+      <h3>Manual transcript test</h3>
+      <div class="row">
+        <div>
+          <label for="source">Source</label>
+          <select id="source">
+            <option value="system">system audio</option>
+            <option value="mic">my mic</option>
+          </select>
+        </div>
+        <div style="grid-column: span 3;">
+          <label for="text">Transcript chunk</label>
+          <input id="text" placeholder="Type a sentence and send..." />
+        </div>
+      </div>
+      <div style="margin-top: 0.8rem;">
+        <button id="send">Send Chunk</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Latest suggestion</h3>
+      <div id="output" class="out">No suggestions yet.</div>
+    </div>
+  </div>
+
+  <script>
+    let socket = null;
+
+    const sessionEl = document.getElementById("session");
+    const providerEl = document.getElementById("provider");
+    const modelEl = document.getElementById("model");
+    const historyModeEl = document.getElementById("historyMode");
+    const contextEl = document.getElementById("context");
+    const statusEl = document.getElementById("status");
+    const outputEl = document.getElementById("output");
+    const sourceEl = document.getElementById("source");
+    const textEl = document.getElementById("text");
+
+    function wsUrl(sessionId) {
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      return `${proto}://${location.host}/ws/${encodeURIComponent(sessionId)}`;
+    }
+
+    function setStatus(msg) {
+      statusEl.textContent = msg;
+    }
+
+    function connect() {
+      const sessionId = sessionEl.value.trim() || "default-room";
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.close();
+      }
+      socket = new WebSocket(wsUrl(sessionId));
+      setStatus(`Connecting to ${sessionId}...`);
+
+      socket.onopen = () => {
+        setStatus("Connected.");
+        socket.send(JSON.stringify({
+          type: "configure",
+          provider: providerEl.value,
+          model: modelEl.value.trim(),
+          history_mode: historyModeEl.value,
+          context: contextEl.value.trim(),
+        }));
+      };
+
+      socket.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "status") {
+          setStatus(msg.message);
+          return;
+        }
+        if (msg.type === "suggestion") {
+          outputEl.textContent = `[${msg.provider}/${msg.model}] ${msg.latency_ms}ms\n\n${msg.text}`;
+          return;
+        }
+        if (msg.type === "error") {
+          setStatus(`Error: ${msg.message}`);
+        }
+      };
+
+      socket.onclose = () => setStatus("Disconnected.");
+      socket.onerror = () => setStatus("WebSocket error.");
+    }
+
+    function sendTranscript() {
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        setStatus("Connect first.");
+        return;
+      }
+      const text = textEl.value.trim();
+      if (!text) return;
+      socket.send(JSON.stringify({
+        type: "transcript",
+        source: sourceEl.value,
+        text,
+        final: true
+      }));
+      textEl.value = "";
+    }
+
+    document.getElementById("connect").addEventListener("click", connect);
+    document.getElementById("send").addEventListener("click", sendTranscript);
+    textEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        sendTranscript();
+      }
+    });
+  </script>
+</body>
+</html>

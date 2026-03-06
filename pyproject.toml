@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meeting-assistant"
+version = "0.1.0"
+description = "Web app + tiny local helper for real-time meeting response suggestions."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.116.0",
+  "httpx>=0.28.0",
+  "numpy>=2.3.0",
+  "sounddevice>=0.5.2",
+  "uvicorn[standard]>=0.35.0",
+  "websockets>=15.0.1",
+  "python-dotenv>=1.1.0",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["backend*"]
+exclude = ["frontend*", "helper*"]
+
+[tool.uv]
+package = false
