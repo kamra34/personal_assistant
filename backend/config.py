@@ -15,9 +15,19 @@ load_dotenv(BASE_DIR / ".env")
 class Settings:
     host: str = os.getenv("ASSISTANT_HOST", "127.0.0.1")
     port: int = int(os.getenv("ASSISTANT_PORT", "8000"))
+    database_url: str = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./assistant.db")
+    cors_origins: str = os.getenv("CORS_ORIGINS", "*")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
     openai_base_url: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+
+    def cors_origins_list(self) -> list[str]:
+        raw = self.cors_origins.strip()
+        if not raw:
+            return ["*"]
+        if raw == "*":
+            return ["*"]
+        return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 settings = Settings()

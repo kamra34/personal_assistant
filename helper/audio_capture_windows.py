@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 from contextlib import ExitStack
 from collections import deque
 from dataclasses import dataclass
@@ -22,7 +23,24 @@ except ModuleNotFoundError:  # Support direct script execution from helper/ path
     from transcribe_stream import Transcriber, make_transcriber
 
 BASE_DIR = Path(__file__).resolve().parents[1]
-load_dotenv(BASE_DIR / ".env")
+
+
+def load_runtime_env() -> None:
+    candidates: list[Path] = [BASE_DIR / ".env", Path.cwd() / ".env"]
+    if getattr(sys, "frozen", False):
+        candidates.insert(0, Path(sys.executable).resolve().parent / ".env")
+    seen: set[Path] = set()
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not resolved.exists():
+            continue
+        load_dotenv(resolved, override=False)
+
+
+load_runtime_env()
 
 
 @dataclass(slots=True)

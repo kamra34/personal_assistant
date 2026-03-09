@@ -3,3 +3,9 @@ __pycache__/
 *.pyc
 .env
 *.egg-info/
+*.db
+build/
+dist/
+*.spec
+web/public/downloads/*.exe
+web/public/downloads/*.app
