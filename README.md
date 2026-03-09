@@ -1,12 +1,27 @@
-# Meeting Assistant MVP (Web + Tiny Local Helper)
+# Meeting Assistant MVP
 
-This is a starter implementation for your preferred approach:
-- Web app UI for session/model/context control and live suggestions
-- Small local helper process that pushes transcript chunks
-- FastAPI websocket backend with provider routing (`mock`, `openai`, `anthropic`)
-- Windows audio helper that captures mic + system loopback and auto-transcribes chunks
+Vercel-compatible frontend + Railway-compatible backend for live meeting assistance.
 
-## 1) Environment setup (use your existing `.venv`)
+## Architecture
+
+- `web/`:
+  - Next.js (App Router) dashboard
+  - Session list, persisted timeline, live suggestion panel
+  - WebSocket + REST integration with backend
+- `backend/`:
+  - FastAPI API + WebSocket server
+  - Provider routing (`mock`, `openai`, `anthropic`)
+  - Persistent storage for sessions, transcripts, and suggestions
+- `helper/`:
+  - `local_helper.py` for manual transcript testing
+  - `ui_agent.py` for local helper API (devices + start/stop capture)
+  - `desktop_agent.py` native desktop UI for local capture control
+  - `audio_capture_windows.py` for mic + system audio capture and STT
+  - `audio_devices.py` shared device ranking/dedup logic
+
+## Local setup
+
+### 1) Python backend and helpers
 
 ```powershell
 .venv\Scripts\Activate.ps1
@@ -15,89 +30,190 @@ python -m pip install -e .
 Copy-Item .env.example .env
 ```
 
-## 2) Run the backend
+### 2) Frontend
+
+```powershell
+cd web
+npm install
+Copy-Item .env.example .env.local
+```
+
+## Run locally
+
+### Terminal A: backend
 
 ```powershell
 .venv\Scripts\Activate.ps1
 python -m backend.main
 ```
 
-Open: `http://127.0.0.1:8000`
+Backend runs at `http://127.0.0.1:8000`.
 
-## 3) Run the tiny local helper (mock transcript mode)
+### Terminal B: Next.js web UI
+
+```powershell
+cd web
+npm run dev
+```
+
+Frontend runs at `http://localhost:3000`.
+
+In the web UI:
+- Use **Audio Source Selection (Local Helper)** to pick mic/system devices from Windows device list.
+- Start/stop local capture directly if Helper Agent is running.
+- Use **Run Options** to either copy the local helper command or download the standalone desktop app.
+- Or copy the generated helper command and run it in terminal.
+
+### Terminal C: Helper Agent (recommended)
 
 ```powershell
 .venv\Scripts\Activate.ps1
-python helper\local_helper.py --session-id default-room --provider mock --model gpt-4o-mini
+python -m helper.ui_agent
 ```
 
-Type lines like:
-- `system: We need a timeline for the migration.`
-- `mic: We can deliver phase one by end of quarter.`
+Helper Agent runs at `http://127.0.0.1:8765` by default.
 
-You should see live suggestions in both helper terminal and web UI.
+### Desktop Agent App (downloadable)
 
-## 4) Switch to real model providers (manual transcript mode)
+From the web UI Run Options, download:
 
-1. Put keys in `.env`:
-   - `OPENAI_API_KEY=...`
-   - `ANTHROPIC_API_KEY=...`
-2. Restart backend.
-3. Select provider/model in UI or helper arguments.
-4. `History mode` options:
-   - `focused` (recommended): answer latest utterance, small rolling context
-   - `full`: use full rolling transcript context
-   - `stateless`: answer latest utterance without transcript history
+- `MeetingAssistantDesktopAgent-standalone.exe`
 
-## 5) Windows live audio mode (mic + system audio)
+Notes:
+- First launch can be slower on corporate Windows due one-file extraction + endpoint security scan.
+- The app can remember local settings and key on the current device.
 
-1. Ensure `.env` includes:
-   - `OPENAI_API_KEY=...`
-   - Optional STT settings:
-     - `STT_PROVIDER=openai`
-     - `STT_MODEL=whisper-1`
-     - `STT_LANGUAGE=en`
-     - `AUDIO_CHUNK_SECONDS=4`
-     - `AUDIO_MIN_RMS=220`
+### Alternative: Desktop Agent Window (mic/system selector UI)
 
-2. List devices and note IDs:
+```powershell
+.venv\Scripts\Activate.ps1
+python helper\desktop_agent.py
+```
+
+This opens a native window to:
+- choose mic/system devices
+- set session/provider/model/history mode
+- set `OPENAI_API_KEY` locally inside the app (for transcription)
+- optionally store key/settings locally using `Remember key on this device`
+- start/stop capture and view logs
+
+Local settings path:
+- Windows: `%APPDATA%\MeetingAssistant\desktop_agent.json`
+- Non-Windows: `~/.meeting_assistant_desktop_agent.json`
+
+Note: live capture backend is currently Windows-only in this MVP.
+
+### Terminal C (optional): manual transcript helper
+
+```powershell
+.venv\Scripts\Activate.ps1
+python helper\local_helper.py --session-id <session-id-from-ui> --provider openai --model gpt-4o-mini --history-mode focused
+```
+
+### Terminal C (optional): Windows audio helper
+
+List devices:
+
 ```powershell
 .venv\Scripts\Activate.ps1
 python helper\audio_capture_windows.py --list-devices
 ```
 
-3. Run live capture:
+Run live capture:
+
+```powershell
+python helper\audio_capture_windows.py --session-id <session-id-from-ui> --provider openai --model gpt-4o-mini --history-mode focused
+```
+
+If needed, pin devices:
+
+```powershell
+python helper\audio_capture_windows.py --session-id <session-id-from-ui> --provider openai --model gpt-4o-mini --history-mode focused --mic-device 15 --system-device 22
+```
+
+## Environment variables
+
+### Backend (`.env`)
+
+- `ASSISTANT_HOST=127.0.0.1`
+- `ASSISTANT_PORT=8000`
+- `DATABASE_URL=sqlite+aiosqlite:///./assistant.db` (local default)
+- `CORS_ORIGINS=*` (set explicit frontend domain in production)
+- `OPENAI_API_KEY=...`
+- `ANTHROPIC_API_KEY=...`
+- `OPENAI_BASE_URL=https://api.openai.com/v1`
+- STT/audio tuning variables from `.env.example`
+
+### Frontend (`web/.env.local`)
+
+- `NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000` (local)
+- `NEXT_PUBLIC_HELPER_AGENT_BASE_URL=http://127.0.0.1:8765` (local)
+
+## Railway + Vercel deployment
+
+### Backend on Railway
+
+1. Deploy repository service using Python.
+2. Set start command:
+   - `python -m backend.main`
+3. Set Railway environment variables:
+   - `DATABASE_URL` (Railway Postgres URL)
+   - `OPENAI_API_KEY`
+   - `CORS_ORIGINS=https://<your-vercel-domain>`
+
+### Frontend on Vercel
+
+1. Import repository in Vercel.
+2. Set project root to `web`.
+3. Set environment variable:
+   - `NEXT_PUBLIC_API_BASE_URL=https://<your-railway-backend-domain>`
+
+## Data model (MVP)
+
+- `sessions`:
+  - id, title, context, provider, model, history_mode, history_lines, created_at, updated_at
+- `transcripts`:
+  - id, session_id, source, text, created_at
+- `suggestions`:
+  - id, session_id, provider, model, latency_ms, text, created_at
+
+## Audio device API
+
+- `GET /api/audio/devices`
+  - Returns local host audio devices (id, name, hostapi, channel capabilities)
+  - Used by frontend dropdowns to build helper run command
+- `GET http://127.0.0.1:8765/api/devices` (Helper Agent)
+  - Returns curated mic/system device lists with de-duplicated host APIs
+  - Better match to what users expect from meeting app audio settings
+
+## Desktop App Packaging
+
+Build Windows `.exe`:
+
 ```powershell
 .venv\Scripts\Activate.ps1
-python helper\audio_capture_windows.py --session-id default-room --provider openai --model gpt-4o-mini
+powershell -ExecutionPolicy Bypass -File helper\packaging\build_windows_desktop_agent.ps1
 ```
 
-Optional device pinning:
-```powershell
-python helper\audio_capture_windows.py --session-id default-room --provider openai --model gpt-4o-mini --mic-device 15 --system-device 22
+Build macOS `.app` (run on macOS):
+
+```bash
+chmod +x helper/packaging/build_macos_desktop_agent.sh
+helper/packaging/build_macos_desktop_agent.sh
 ```
 
-Notes:
-- The helper first tries a `Stereo Mix`-like input device for system audio (recommended when available).
-- Some `sounddevice`/PortAudio builds do not support direct WASAPI output loopback; in that case use `--system-device` with a system input (typically `Stereo Mix`).
-- Use `--list-devices` to find valid IDs for `--mic-device` and `--system-device`.
-- Some devices only support specific channel counts. The helper now auto-negotiates a valid sample-rate/channel format (for example your WASAPI mic may require 4 channels).
-- If transcription is too noisy, increase:
-  - `AUDIO_SPEECH_START_RMS`
-  - `AUDIO_SPEECH_END_RMS`
-  - `AUDIO_END_SILENCE_SECONDS`
-- If replies are delayed too much, decrease `AUDIO_END_SILENCE_SECONDS` and `AUDIO_MIN_UTTERANCE_SECONDS`.
-- For interview-style behavior, keep `--history-mode focused` so answers stay on the latest question without forgetting recent context.
+Build outputs are copied to `web/public/downloads/` for UI download links.
+Current Windows output names:
+- `MeetingAssistantDesktopAgent-standalone.exe` (preferred in UI)
+- `MeetingAssistantDesktopAgent.exe` (legacy alias)
 
-## Current scope
+## AI Contributor Handoff
 
-- Implemented:
-  - websocket sessioning
-  - context + transcript aggregation
-  - provider abstraction and live suggestion loop
-  - Windows mic + system audio capture (Stereo Mix input and WASAPI loopback when supported)
-  - chunked speech-to-text forwarding to websocket
-- Not implemented yet:
-  - diarization
-  - smarter VAD/turn detection
-  - transcript deduplication and confidence filtering
+Use [PROJECT_CONTEXT.md](./PROJECT_CONTEXT.md) when starting a new AI coding tool session.
+It contains architecture, runbook, key files, and implementation constraints for faster contribution.
+
+## Next steps
+
+- Add auth and user ownership for sessions
+- Add transcript confidence scoring and better endpointing
+- Add retrieval over past sessions and tagging/search
