@@ -32,6 +32,7 @@ class LiveSession:
     history_lines: int = 10
     transcript_lines: deque[str] = field(default_factory=lambda: deque(maxlen=80))
     sockets: set[WebSocket] = field(default_factory=set)
+    capture_sockets: set[WebSocket] = field(default_factory=set)
     generation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def configure(self, payload: dict[str, Any]) -> None:

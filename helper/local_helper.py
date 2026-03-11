@@ -67,6 +67,7 @@ async def main() -> None:
             json.dumps(
                 {
                     "type": "configure",
+                    "client_role": "capture",
                     "provider": args.provider,
                     "model": args.model,
                     "context": args.context,

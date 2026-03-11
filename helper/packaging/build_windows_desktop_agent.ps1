@@ -25,6 +25,7 @@ if ($LASTEXITCODE -ne 0) {
   --windowed `
   --name "MeetingAssistantDesktopAgent" `
   --paths "$ProjectPath" `
+  --hidden-import "helper.ui_agent" `
   --hidden-import "helper.audio_capture_windows" `
   "$ProjectPath\helper\desktop_agent.py"
 

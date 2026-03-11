@@ -4,7 +4,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import Select, desc, func, select
+from sqlalchemy import Select, delete, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import SessionRecord, SuggestionRecord, TranscriptRecord
@@ -226,4 +226,15 @@ async def get_events(
     if len(events) > capped:
         events = events[-capped:]
     return events
+
+
+async def delete_session(db: AsyncSession, session_id: str) -> bool:
+    row = await db.get(SessionRecord, session_id)
+    if row is None:
+        return False
+    await db.execute(delete(TranscriptRecord).where(TranscriptRecord.session_id == session_id))
+    await db.execute(delete(SuggestionRecord).where(SuggestionRecord.session_id == session_id))
+    await db.delete(row)
+    await db.commit()
+    return True
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -16,6 +17,7 @@ from .repository import (
     add_suggestion,
     add_transcript,
     create_session,
+    delete_session,
     get_events,
     get_or_create_session as db_get_or_create_session,
     get_session,
@@ -38,6 +40,30 @@ app.add_middleware(
 )
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 sessions: dict[str, LiveSession] = {}
+session_write_locks: dict[str, asyncio.Lock] = {}
+deleting_sessions: set[str] = set()
+
+
+def get_session_write_lock(session_id: str) -> asyncio.Lock:
+    lock = session_write_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        session_write_locks[session_id] = lock
+    return lock
+
+
+def is_capture_client(payload: dict[str, Any]) -> bool:
+    role = payload.get("client_role")
+    if not isinstance(role, str):
+        return False
+    return role.strip().lower() in {"capture", "recorder", "audio-capture"}
+
+
+def set_socket_capture_role(session: LiveSession, websocket: WebSocket, payload: dict[str, Any]) -> None:
+    if is_capture_client(payload):
+        session.capture_sockets.add(websocket)
+        return
+    session.capture_sockets.discard(websocket)
 
 
 class SessionCreateIn(BaseModel):
@@ -89,6 +115,7 @@ async def broadcast(session: LiveSession, payload: dict[str, Any]) -> None:
             stale.append(ws)
     for ws in stale:
         session.sockets.discard(ws)
+        session.capture_sockets.discard(ws)
 
 
 @app.on_event("startup")
@@ -110,6 +137,41 @@ def api_audio_devices() -> dict[str, Any]:
 async def api_list_sessions(limit: int = Query(default=50, ge=1, le=200)) -> dict[str, Any]:
     async with SessionLocal() as db:
         items = await list_sessions(db, limit=limit)
+    return {"items": items}
+
+
+@app.get("/api/live-sessions")
+async def api_list_live_sessions() -> dict[str, Any]:
+    live_ids = [sid for sid, live in sessions.items() if len(live.capture_sockets) > 0]
+    if not live_ids:
+        return {"items": []}
+
+    items: list[dict[str, Any]] = []
+    async with SessionLocal() as db:
+        for sid in live_ids:
+            live = sessions.get(sid)
+            socket_count = len(live.sockets) if live else 0
+            capture_socket_count = len(live.capture_sockets) if live else 0
+            item = await get_session(db, sid)
+            if item is None and live is not None:
+                now = datetime.now(UTC).isoformat()
+                item = {
+                    "id": sid,
+                    "title": "Untitled Session",
+                    "context": live.context,
+                    "provider": live.provider_name,
+                    "model": live.model,
+                    "history_mode": live.history_mode,
+                    "history_lines": live.history_lines,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            if item is None:
+                continue
+            item["socket_count"] = socket_count
+            item["capture_socket_count"] = capture_socket_count
+            items.append(item)
+    items.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
     return {"items": items}
 
 
@@ -138,6 +200,35 @@ async def api_get_session(session_id: str) -> dict[str, Any]:
     if item is None:
         raise HTTPException(status_code=404, detail="Session not found.")
     return item
+
+
+@app.delete("/api/sessions/{session_id}")
+async def api_delete_session(session_id: str) -> dict[str, Any]:
+    deleting_sessions.add(session_id)
+    try:
+        live = sessions.pop(session_id, None)
+        sockets: list[WebSocket] = []
+        if live is not None:
+            sockets = list(live.sockets)
+            live.sockets.clear()
+            live.capture_sockets.clear()
+        for ws in sockets:
+            try:
+                await ws.close(code=1001, reason="Session deleted")
+            except Exception:
+                pass
+
+        async with get_session_write_lock(session_id):
+            async with SessionLocal() as db:
+                deleted = await delete_session(db, session_id)
+
+        if not deleted and live is None:
+            raise HTTPException(status_code=404, detail="Session not found.")
+        return {"deleted": bool(deleted or live is not None), "session_id": session_id}
+    finally:
+        deleting_sessions.discard(session_id)
+        if session_id not in sessions:
+            session_write_locks.pop(session_id, None)
 
 
 @app.patch("/api/sessions/{session_id}/config")
@@ -202,6 +293,9 @@ def index() -> FileResponse:
 @app.websocket("/ws/{session_id}")
 async def session_ws(websocket: WebSocket, session_id: str) -> None:
     await websocket.accept()
+    if session_id in deleting_sessions:
+        await websocket.close(code=1001, reason="Session deleted")
+        return
     session = await get_or_create_live_session(session_id)
     session.sockets.add(websocket)
     await websocket.send_json(
@@ -225,19 +319,26 @@ async def session_ws(websocket: WebSocket, session_id: str) -> None:
     try:
         while True:
             data = await websocket.receive_json()
+            if session_id in deleting_sessions:
+                await websocket.send_json({"type": "error", "message": "Session is being deleted."})
+                break
             msg_type = (data.get("type") or "").strip().lower()
             if msg_type == "configure":
+                set_socket_capture_role(session, websocket, data)
                 session.configure(data)
-                async with SessionLocal() as db:
-                    await update_session_config(
-                        db,
-                        session_id=session_id,
-                        provider=session.provider_name,
-                        model=session.model,
-                        context=session.context,
-                        history_mode=session.history_mode,
-                        history_lines=session.history_lines,
-                    )
+                async with get_session_write_lock(session_id):
+                    if session_id in deleting_sessions:
+                        continue
+                    async with SessionLocal() as db:
+                        await update_session_config(
+                            db,
+                            session_id=session_id,
+                            provider=session.provider_name,
+                            model=session.model,
+                            context=session.context,
+                            history_mode=session.history_mode,
+                            history_lines=session.history_lines,
+                        )
                 await broadcast(
                     session,
                     {
@@ -258,13 +359,16 @@ async def session_ws(websocket: WebSocket, session_id: str) -> None:
                 source = (data.get("source") or "unknown").strip()
                 final = bool(data.get("final", True))
                 session.add_transcript(source=source, text=text)
-                async with SessionLocal() as db:
-                    await add_transcript(
-                        db,
-                        session_id=session_id,
-                        source=source,
-                        text=text,
-                    )
+                async with get_session_write_lock(session_id):
+                    if session_id in deleting_sessions:
+                        continue
+                    async with SessionLocal() as db:
+                        await add_transcript(
+                            db,
+                            session_id=session_id,
+                            source=source,
+                            text=text,
+                        )
                 await broadcast(
                     session,
                     {
@@ -276,20 +380,27 @@ async def session_ws(websocket: WebSocket, session_id: str) -> None:
                     },
                 )
                 if final:
+                    if session_id in deleting_sessions:
+                        continue
                     try:
                         suggestion = await session.generate_suggestion(
                             latest_source=source,
                             latest_text=text,
                         )
-                        async with SessionLocal() as db:
-                            await add_suggestion(
-                                db,
-                                session_id=session_id,
-                                provider=suggestion["provider"],
-                                model=suggestion["model"],
-                                latency_ms=int(suggestion["latency_ms"]),
-                                text=suggestion["text"],
-                            )
+                        async with get_session_write_lock(session_id):
+                            if session_id in deleting_sessions:
+                                continue
+                            async with SessionLocal() as db:
+                                await add_suggestion(
+                                    db,
+                                    session_id=session_id,
+                                    provider=suggestion["provider"],
+                                    model=suggestion["model"],
+                                    latency_ms=int(suggestion["latency_ms"]),
+                                    text=suggestion["text"],
+                                )
+                        if session_id in deleting_sessions:
+                            continue
                         await broadcast(session, suggestion)
                     except Exception as exc:  # pragma: no cover - best effort reporting
                         await websocket.send_json(
@@ -302,6 +413,13 @@ async def session_ws(websocket: WebSocket, session_id: str) -> None:
             await websocket.send_json({"type": "error", "message": "Unknown message type."})
     except WebSocketDisconnect:
         session.sockets.discard(websocket)
+        session.capture_sockets.discard(websocket)
+    finally:
+        session.sockets.discard(websocket)
+        session.capture_sockets.discard(websocket)
+        if len(session.sockets) == 0:
+            sessions.pop(session_id, None)
+            session_write_locks.pop(session_id, None)
 
 
 def run() -> None:

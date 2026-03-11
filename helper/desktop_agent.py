@@ -6,14 +6,21 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
 import webbrowser
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from tkinter import BooleanVar, StringVar, Tk, ttk, messagebox
+from tkinter import END, BooleanVar, Listbox, StringVar, Tk, ttk, messagebox
 from tkinter.scrolledtext import ScrolledText
+from typing import Any
 
 from dotenv import load_dotenv
+from websockets.sync.client import connect as ws_connect
 
 try:
     from helper.audio_devices import load_devices
@@ -142,13 +149,24 @@ class DesktopAgentApp:
 
         self.process: subprocess.Popen[str] | None = None
         self.log_queue: queue.Queue[str] = queue.Queue()
+        self.live_queue: queue.Queue[str] = queue.Queue()
+        self.live_status_queue: queue.Queue[str] = queue.Queue()
         self.mic_map: dict[str, str] = {}
         self.system_map: dict[str, str] = {}
         self.loaded_env_files = seed_environment_from_dotenv()
         self.settings_path = default_settings_path()
+        self.live_thread: threading.Thread | None = None
+        self.live_stop_event = threading.Event()
+        self.live_session_id = ""
+        self.helper_agent_process: subprocess.Popen[str] | None = None
+        self.helper_agent_managed = False
+        self.helper_agent_key = ""
+        self.live_sessions_cache: list[dict[str, Any]] = []
+        self.saved_sessions_cache: list[dict[str, Any]] = []
         loaded_settings = DesktopSettings.load(self.settings_path)
 
-        self.session_var = StringVar(value=loaded_settings.session_id)
+        # Start with an empty session field and require explicit Create/Join action.
+        self.session_var = StringVar(value="")
         self.server_var = StringVar(
             value=loaded_settings.server or os.getenv("DESKTOP_AGENT_WS_SERVER", "ws://127.0.0.1:8000")
         )
@@ -169,6 +187,10 @@ class DesktopAgentApp:
         self.remember_api_key_var = BooleanVar(value=loaded_settings.remember_api_key)
         self.api_key_status_var = StringVar(value="")
         self.status_var = StringVar(value="Stopped")
+        self.live_status_var = StringVar(value="Live view: disconnected")
+        self.helper_status_var = StringVar(value="Helper: unknown")
+        self.live_sessions_summary_var = StringVar(value="No live sessions running.")
+        self.saved_sessions_summary_var = StringVar(value="No saved sessions found.")
         self.pending_mic_id = loaded_settings.mic_device_id
         self.pending_system_id = loaded_settings.system_device_id
 
@@ -182,8 +204,11 @@ class DesktopAgentApp:
         else:
             self.append_log("[desktop-agent] no .env found; set OPENAI_API_KEY in app before start.")
         self.append_log(f"[desktop-agent] settings file: {self.settings_path}")
+        self.ensure_helper_agent_running()
+        self.refresh_session_lists(silent=True)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(200, self.drain_logs)
+        self.root.after(6000, self.poll_session_lists)
 
     @staticmethod
     def _label_for_device(item: dict[str, object]) -> str:
@@ -195,6 +220,13 @@ class DesktopAgentApp:
     def _on_api_key_change(self, *_: object) -> None:
         has_key = bool(self.openai_api_key_var.get().strip())
         self.api_key_status_var.set(f"OPENAI_API_KEY: {'set' if has_key else 'missing'}")
+        if (
+            self.helper_agent_managed
+            and self.helper_agent_process is not None
+            and self.helper_agent_process.poll() is None
+            and (self.openai_api_key_var.get().strip() or os.getenv("OPENAI_API_KEY", "").strip()) != self.helper_agent_key
+        ):
+            self.helper_status_var.set("Helper: restart needed (key changed)")
 
     def _build_ui(self) -> None:
         pad = {"padx": 8, "pady": 4}
@@ -207,16 +239,20 @@ class DesktopAgentApp:
             text="Meeting Assistant Desktop Agent",
             font=("Segoe UI", 14, "bold"),
         )
-        header.grid(row=0, column=0, columnspan=6, sticky="w", **pad)
+        header.grid(row=0, column=0, columnspan=5, sticky="w", **pad)
+        ttk.Label(frame, textvariable=self.helper_status_var).grid(row=0, column=5, sticky="e", **pad)
 
         ttk.Label(frame, text="Session ID").grid(row=1, column=0, sticky="w", **pad)
         ttk.Entry(frame, textvariable=self.session_var, width=28).grid(
             row=1, column=1, sticky="we", **pad
         )
+        ttk.Button(frame, text="Create Session", command=self.create_session).grid(
+            row=1, column=2, sticky="we", **pad
+        )
 
-        ttk.Label(frame, text="WebSocket Server").grid(row=1, column=2, sticky="w", **pad)
+        ttk.Label(frame, text="WebSocket Server").grid(row=1, column=3, sticky="w", **pad)
         ttk.Entry(frame, textvariable=self.server_var, width=30).grid(
-            row=1, column=3, columnspan=3, sticky="we", **pad
+            row=1, column=4, columnspan=2, sticky="we", **pad
         )
 
         ttk.Label(frame, text="Provider").grid(row=2, column=0, sticky="w", **pad)
@@ -269,7 +305,7 @@ class DesktopAgentApp:
         ttk.Entry(frame, textvariable=self.dashboard_url_var, width=30).grid(
             row=4, column=4, sticky="we", **pad
         )
-        ttk.Button(frame, text="Open Dashboard", command=self.open_dashboard).grid(
+        ttk.Button(frame, text="Open Session in Web", command=self.open_dashboard).grid(
             row=4, column=5, sticky="we", **pad
         )
 
@@ -295,11 +331,66 @@ class DesktopAgentApp:
         ttk.Button(frame, text="Stop Capture", command=self.stop_capture).grid(
             row=6, column=1, sticky="we", **pad
         )
-        ttk.Label(frame, textvariable=self.status_var).grid(row=6, column=2, columnspan=4, sticky="w", **pad)
+        ttk.Label(frame, textvariable=self.status_var).grid(row=6, column=2, columnspan=2, sticky="w", **pad)
+        ttk.Label(frame, textvariable=self.live_status_var).grid(row=6, column=4, columnspan=2, sticky="w", **pad)
 
-        self.log_view = ScrolledText(frame, wrap="word", height=22, font=("Consolas", 9))
-        self.log_view.grid(row=7, column=0, columnspan=6, sticky="nsew", padx=8, pady=8)
+        tabs = ttk.Notebook(frame)
+        tabs.grid(row=7, column=0, columnspan=6, sticky="nsew", padx=8, pady=8)
+
+        conversation_tab = ttk.Frame(tabs)
+        logs_tab = ttk.Frame(tabs)
+        sessions_tab = ttk.Frame(tabs)
+        tabs.add(conversation_tab, text="Conversation")
+        tabs.add(logs_tab, text="System Logs")
+        tabs.add(sessions_tab, text="Sessions")
+
+        self.conversation_view = ScrolledText(
+            conversation_tab, wrap="word", height=22, font=("Consolas", 9)
+        )
+        self.conversation_view.pack(fill="both", expand=True)
+        self.conversation_view.configure(state="disabled")
+
+        self.log_view = ScrolledText(logs_tab, wrap="word", height=22, font=("Consolas", 9))
+        self.log_view.pack(fill="both", expand=True)
         self.log_view.configure(state="disabled")
+
+        sessions_tab.columnconfigure(0, weight=1)
+        sessions_tab.columnconfigure(1, weight=1)
+        sessions_tab.rowconfigure(2, weight=1)
+        sessions_tab.rowconfigure(5, weight=1)
+
+        ttk.Label(sessions_tab, text="Live Sessions", font=("Segoe UI", 10, "bold")).grid(
+            row=0, column=0, sticky="w", padx=6, pady=(6, 2)
+        )
+        ttk.Label(sessions_tab, textvariable=self.live_sessions_summary_var).grid(
+            row=1, column=0, sticky="w", padx=6, pady=(0, 4)
+        )
+        self.live_sessions_listbox = Listbox(sessions_tab, height=8, exportselection=False)
+        self.live_sessions_listbox.grid(row=2, column=0, sticky="nsew", padx=6, pady=4)
+        live_actions = ttk.Frame(sessions_tab)
+        live_actions.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 8))
+        ttk.Button(live_actions, text="Refresh Live", command=self.refresh_live_sessions).pack(side="left")
+        ttk.Button(live_actions, text="Join Live", command=self.join_selected_live_session).pack(
+            side="left", padx=(6, 0)
+        )
+
+        ttk.Label(sessions_tab, text="Saved Sessions", font=("Segoe UI", 10, "bold")).grid(
+            row=0, column=1, sticky="w", padx=6, pady=(6, 2)
+        )
+        ttk.Label(sessions_tab, textvariable=self.saved_sessions_summary_var).grid(
+            row=1, column=1, sticky="w", padx=6, pady=(0, 4)
+        )
+        self.saved_sessions_listbox = Listbox(sessions_tab, height=8, exportselection=False)
+        self.saved_sessions_listbox.grid(row=2, column=1, rowspan=4, sticky="nsew", padx=6, pady=4)
+        saved_actions = ttk.Frame(sessions_tab)
+        saved_actions.grid(row=6, column=1, sticky="ew", padx=6, pady=(0, 8))
+        ttk.Button(saved_actions, text="Refresh Saved", command=self.refresh_saved_sessions).pack(side="left")
+        ttk.Button(saved_actions, text="Join Saved", command=self.join_selected_saved_session).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(saved_actions, text="Delete Saved", command=self.delete_selected_saved_session).pack(
+            side="left", padx=(6, 0)
+        )
 
         for col in range(6):
             frame.columnconfigure(col, weight=1)
@@ -310,6 +401,12 @@ class DesktopAgentApp:
         self.log_view.insert("end", line + "\n")
         self.log_view.see("end")
         self.log_view.configure(state="disabled")
+
+    def append_conversation(self, line: str) -> None:
+        self.conversation_view.configure(state="normal")
+        self.conversation_view.insert("end", line + "\n")
+        self.conversation_view.see("end")
+        self.conversation_view.configure(state="disabled")
 
     def refresh_devices(self) -> None:
         payload = load_devices()
@@ -365,6 +462,293 @@ class DesktopAgentApp:
             return ""
         return self.system_map.get(value, "")
 
+    def _api_base_from_server(self) -> str:
+        raw = self.server_var.get().strip()
+        if not raw:
+            raise ValueError("WebSocket Server is empty.")
+        parsed = urllib.parse.urlparse(raw)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError("WebSocket Server must include scheme and host, for example ws://127.0.0.1:8000")
+        if parsed.scheme in {"ws", "http"}:
+            scheme = "http"
+        elif parsed.scheme in {"wss", "https"}:
+            scheme = "https"
+        else:
+            raise ValueError(f"Unsupported server scheme: {parsed.scheme}")
+        return f"{scheme}://{parsed.netloc}"
+
+    def _helper_base_url(self) -> str:
+        return os.getenv("HELPER_AGENT_BASE_URL", "http://127.0.0.1:8765").rstrip("/")
+
+    def _helper_health_ok(self) -> bool:
+        url = f"{self._helper_base_url()}/api/health"
+        request = urllib.request.Request(url=url, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=1.5) as response:
+                body = response.read().decode("utf-8", errors="replace")
+            payload = json.loads(body)
+            return str(payload.get("status", "")).strip().lower() == "ok"
+        except Exception:
+            return False
+
+    def _spawn_helper_command(self) -> list[str]:
+        if getattr(sys, "frozen", False):
+            return [sys.executable, "--helper-agent"]
+        return [sys.executable, str(Path(__file__).resolve()), "--helper-agent"]
+
+    def _read_helper_logs(self, proc: subprocess.Popen[str]) -> None:
+        if proc.stdout is None:
+            return
+        for line in iter(proc.stdout.readline, ""):
+            clean = line.rstrip("\n")
+            if clean:
+                self.log_queue.put(f"[helper-agent] {clean}")
+        proc.stdout.close()
+        code = proc.poll()
+        self.log_queue.put(f"[helper-agent] exited with code {code}")
+
+    def stop_helper_agent(self) -> None:
+        proc = self.helper_agent_process
+        if not self.helper_agent_managed or proc is None:
+            return
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        self.helper_agent_process = None
+        self.helper_agent_managed = False
+        self.helper_agent_key = ""
+        self.helper_status_var.set("Helper: stopped")
+
+    def ensure_helper_agent_running(self) -> None:
+        current_key = self.openai_api_key_var.get().strip() or os.getenv("OPENAI_API_KEY", "").strip()
+
+        if self.helper_agent_managed and self.helper_agent_process is not None:
+            if self.helper_agent_process.poll() is None and current_key == self.helper_agent_key:
+                self.helper_status_var.set("Helper: running (desktop)")
+                return
+            self.stop_helper_agent()
+
+        if self._helper_health_ok():
+            self.helper_status_var.set("Helper: running (external)")
+            return
+
+        cmd = self._spawn_helper_command()
+        env = os.environ.copy()
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        if current_key:
+            env["OPENAI_API_KEY"] = current_key
+        self.helper_agent_key = current_key
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(WORK_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        self.helper_agent_process = proc
+        self.helper_agent_managed = True
+        self.helper_status_var.set("Helper: starting...")
+        self.append_log("[desktop-agent] starting helper agent for web capture control")
+        self.append_log(" ".join(cmd))
+        thread = threading.Thread(target=self._read_helper_logs, args=(proc,), daemon=True)
+        thread.start()
+
+        for _ in range(25):
+            if proc.poll() is not None:
+                break
+            if self._helper_health_ok():
+                self.helper_status_var.set("Helper: running (desktop)")
+                self.append_log("[desktop-agent] helper agent is healthy")
+                return
+            time.sleep(0.2)
+
+        if proc.poll() is not None:
+            self.helper_status_var.set("Helper: failed")
+            self.append_log("[desktop-agent] helper agent failed to start")
+            return
+        self.helper_status_var.set("Helper: starting (slow)")
+
+    def _api_request_json(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        timeout: float = 8.0,
+    ) -> dict[str, Any]:
+        api_base = self._api_base_from_server()
+        body: bytes | None = None
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url=f"{api_base}{path}",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method=method.upper(),
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+        parsed = json.loads(raw) if raw else {}
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f"Unexpected API response for {path}: {raw[:200]}")
+        return parsed
+
+    @staticmethod
+    def _session_label(item: dict[str, Any], include_socket_count: bool = False) -> str:
+        title = str(item.get("title", "") or "Untitled Session")
+        provider = str(item.get("provider", ""))
+        model = str(item.get("model", ""))
+        session_id = str(item.get("id", ""))
+        socket_suffix = ""
+        if include_socket_count:
+            capture_count = int(item.get("capture_socket_count", 0) or 0)
+            socket_count = int(item.get("socket_count", 0) or 0)
+            socket_suffix = f" | capture={capture_count} | sockets={socket_count}"
+        return f"{title} | {provider}/{model} | {session_id}{socket_suffix}"
+
+    @staticmethod
+    def _selected_session_id(listbox: Listbox, items: list[dict[str, Any]]) -> str:
+        selection = listbox.curselection()
+        if not selection:
+            return ""
+        index = int(selection[0])
+        if index < 0 or index >= len(items):
+            return ""
+        return str(items[index].get("id", ""))
+
+    def refresh_live_sessions(self, silent: bool = False) -> None:
+        try:
+            data = self._api_request_json("GET", "/api/live-sessions", timeout=4.0)
+            items = data.get("items", [])
+            if not isinstance(items, list):
+                items = []
+            self.live_sessions_cache = [item for item in items if isinstance(item, dict)]
+            self.live_sessions_listbox.delete(0, END)
+            for item in self.live_sessions_cache:
+                self.live_sessions_listbox.insert(END, self._session_label(item, include_socket_count=True))
+            if self.live_sessions_cache:
+                self.live_sessions_summary_var.set(f"{len(self.live_sessions_cache)} live session(s)")
+            else:
+                self.live_sessions_summary_var.set("No live sessions running.")
+        except Exception as exc:
+            self.live_sessions_cache = []
+            self.live_sessions_listbox.delete(0, END)
+            self.live_sessions_summary_var.set("No live sessions running.")
+            if silent:
+                self.append_log(f"[desktop-agent] live sessions refresh failed: {exc}")
+            else:
+                messagebox.showerror("Live Sessions Error", str(exc))
+
+    def refresh_saved_sessions(self, silent: bool = False) -> None:
+        try:
+            data = self._api_request_json("GET", "/api/sessions?limit=200", timeout=6.0)
+            items = data.get("items", [])
+            if not isinstance(items, list):
+                items = []
+            self.saved_sessions_cache = [item for item in items if isinstance(item, dict)]
+            self.saved_sessions_listbox.delete(0, END)
+            for item in self.saved_sessions_cache:
+                self.saved_sessions_listbox.insert(END, self._session_label(item, include_socket_count=False))
+            if self.saved_sessions_cache:
+                self.saved_sessions_summary_var.set(f"{len(self.saved_sessions_cache)} saved session(s)")
+            else:
+                self.saved_sessions_summary_var.set("No saved sessions found.")
+        except Exception as exc:
+            self.saved_sessions_cache = []
+            self.saved_sessions_listbox.delete(0, END)
+            self.saved_sessions_summary_var.set("No saved sessions found.")
+            if silent:
+                self.append_log(f"[desktop-agent] saved sessions refresh failed: {exc}")
+            else:
+                messagebox.showerror("Saved Sessions Error", str(exc))
+
+    def refresh_session_lists(self, silent: bool = False) -> None:
+        self.refresh_live_sessions(silent=silent)
+        self.refresh_saved_sessions(silent=silent)
+
+    def poll_session_lists(self) -> None:
+        self.refresh_session_lists(silent=True)
+        self.root.after(6000, self.poll_session_lists)
+
+    def join_selected_live_session(self) -> None:
+        session_id = self._selected_session_id(self.live_sessions_listbox, self.live_sessions_cache)
+        if not session_id:
+            return
+        self.session_var.set(session_id)
+        self.ensure_live_view_for_current_session()
+        self.persist_settings()
+        self.status_var.set("Joined live session")
+        self.append_log(f"[desktop-agent] joined live session: {session_id}")
+
+    def join_selected_saved_session(self) -> None:
+        session_id = self._selected_session_id(self.saved_sessions_listbox, self.saved_sessions_cache)
+        if not session_id:
+            return
+        self.session_var.set(session_id)
+        self.ensure_live_view_for_current_session()
+        self.persist_settings()
+        self.status_var.set("Joined saved session")
+        self.append_log(f"[desktop-agent] joined saved session: {session_id}")
+
+    def delete_selected_saved_session(self) -> None:
+        session_id = self._selected_session_id(self.saved_sessions_listbox, self.saved_sessions_cache)
+        if not session_id:
+            return
+        label = session_id
+        index = self.saved_sessions_listbox.curselection()
+        if index:
+            idx = int(index[0])
+            if 0 <= idx < len(self.saved_sessions_cache):
+                label = str(self.saved_sessions_cache[idx].get("title", session_id))
+        if not messagebox.askyesno("Delete Session", f'Delete session "{label}"? This cannot be undone.'):
+            return
+        try:
+            self._api_request_json("DELETE", f"/api/sessions/{urllib.parse.quote(session_id, safe='')}", timeout=8.0)
+            self.append_log(f"[desktop-agent] deleted session: {session_id}")
+            if self.session_var.get().strip() == session_id:
+                self.stop_capture()
+                self.session_var.set("")
+                self.stop_live_view()
+            self.refresh_session_lists(silent=True)
+            self.persist_settings()
+        except Exception as exc:
+            messagebox.showerror("Delete Failed", str(exc))
+
+    def create_session(self) -> None:
+        self.ensure_helper_agent_running()
+
+        title = f"Desktop Session {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        payload = {
+            "title": title,
+            "context": "",
+            "provider": self.provider_var.get().strip() or "openai",
+            "model": self.model_var.get().strip() or "gpt-4o-mini",
+            "history_mode": self.history_mode_var.get().strip() or "focused",
+        }
+
+        try:
+            parsed = self._api_request_json("POST", "/api/sessions", payload=payload, timeout=12.0)
+        except Exception as exc:
+            messagebox.showerror("Session Create Failed", str(exc))
+            return
+
+        session_id = str(parsed.get("id", "")).strip()
+        if not session_id:
+            messagebox.showerror("Session Create Failed", "Backend response missing session id.")
+            return
+
+        self.session_var.set(session_id)
+        self.status_var.set("Session created")
+        self.append_log(f"[desktop-agent] created session: {session_id}")
+        self.ensure_live_view_for_current_session()
+        self.refresh_session_lists(silent=True)
+        self.persist_settings()
+
     def _collect_settings(self) -> DesktopSettings:
         stt_provider = os.getenv("STT_PROVIDER", "openai").strip().lower()
         key = self.openai_api_key_var.get().strip()
@@ -397,7 +781,87 @@ class DesktopAgentApp:
             return [sys.executable, "--capture-worker", *capture_args]
         return [sys.executable, str(Path(__file__).resolve()), "--capture-worker", *capture_args]
 
+    @staticmethod
+    def _display_time() -> str:
+        return datetime.now().strftime("%H:%M:%S")
+
+    def _ws_url_for_session(self, session_id: str) -> str:
+        raw = self.server_var.get().strip()
+        if not raw:
+            raise ValueError("WebSocket Server is empty.")
+        parsed = urllib.parse.urlparse(raw)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError("WebSocket Server must include scheme and host.")
+        if parsed.scheme in {"ws", "http"}:
+            scheme = "ws"
+        elif parsed.scheme in {"wss", "https"}:
+            scheme = "wss"
+        else:
+            raise ValueError(f"Unsupported server scheme: {parsed.scheme}")
+        return f"{scheme}://{parsed.netloc}/ws/{urllib.parse.quote(session_id, safe='')}"
+
+    def ensure_live_view_for_current_session(self) -> None:
+        session_id = self.session_var.get().strip()
+        if not session_id:
+            self.live_status_var.set("Live view: waiting for session")
+            return
+        if self.live_thread is not None and self.live_thread.is_alive() and self.live_session_id == session_id:
+            return
+        self.stop_live_view()
+        self.start_live_view(session_id)
+
+    def start_live_view(self, session_id: str) -> None:
+        if not session_id:
+            return
+        self.live_stop_event.clear()
+        self.live_session_id = session_id
+        self.live_status_var.set(f"Live view: connecting ({session_id})")
+        self.live_thread = threading.Thread(
+            target=self._live_listener_worker,
+            args=(session_id,),
+            daemon=True,
+        )
+        self.live_thread.start()
+
+    def stop_live_view(self) -> None:
+        self.live_stop_event.set()
+        thread = self.live_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.5)
+        self.live_thread = None
+        self.live_session_id = ""
+        self.live_status_var.set("Live view: disconnected")
+
+    def _live_listener_worker(self, session_id: str) -> None:
+        try:
+            url = self._ws_url_for_session(session_id)
+        except Exception as exc:
+            self.log_queue.put(f"[desktop-agent] live view setup error: {exc}")
+            self.live_status_queue.put("Live view: invalid server")
+            return
+
+        while not self.live_stop_event.is_set():
+            try:
+                with ws_connect(url, open_timeout=8, close_timeout=2) as ws:
+                    self.log_queue.put(f"[desktop-agent] live view connected: {session_id}")
+                    self.live_status_queue.put(f"Live view: connected ({session_id})")
+                    while not self.live_stop_event.is_set():
+                        try:
+                            raw = ws.recv(timeout=1)
+                        except TimeoutError:
+                            continue
+                        if raw is None:
+                            break
+                        self._handle_live_message(raw)
+            except Exception as exc:
+                if self.live_stop_event.is_set():
+                    break
+                self.log_queue.put(f"[desktop-agent] live view reconnecting: {exc}")
+                self.live_status_queue.put("Live view: reconnecting...")
+                self.live_stop_event.wait(2.0)
+
     def start_capture(self) -> None:
+        self.ensure_helper_agent_running()
         if os.name != "nt":
             messagebox.showerror(
                 "Not Supported",
@@ -412,6 +876,7 @@ class DesktopAgentApp:
         if not session_id:
             messagebox.showwarning("Missing Session", "Please enter a session ID.")
             return
+        self.ensure_live_view_for_current_session()
 
         stt_provider = os.getenv("STT_PROVIDER", "openai").strip().lower()
         openai_api_key = self.openai_api_key_var.get().strip() or os.getenv("OPENAI_API_KEY", "").strip()
@@ -471,6 +936,38 @@ class DesktopAgentApp:
         thread = threading.Thread(target=self._read_process_logs, daemon=True)
         thread.start()
 
+    def _handle_live_message(self, raw: str) -> None:
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return
+        msg_type = str(payload.get("type", ""))
+        if msg_type == "transcript":
+            source = str(payload.get("source", "unknown"))
+            text = str(payload.get("text", "")).strip()
+            if text:
+                self.live_queue.put(f"[{self._display_time()}] {source}: {text}")
+            return
+        if msg_type == "suggestion":
+            provider = str(payload.get("provider", "unknown"))
+            model = str(payload.get("model", "unknown"))
+            latency = int(payload.get("latency_ms", 0) or 0)
+            text = str(payload.get("text", "")).strip()
+            if text:
+                self.live_queue.put(
+                    f"[{self._display_time()}] suggestion {provider}/{model} {latency}ms\n{text}\n"
+                )
+            return
+        if msg_type == "status":
+            message = str(payload.get("message", "")).strip()
+            if message:
+                self.live_queue.put(f"[{self._display_time()}] status: {message}")
+            return
+        if msg_type == "error":
+            message = str(payload.get("message", "")).strip()
+            if message:
+                self.live_queue.put(f"[{self._display_time()}] error: {message}")
+
     def _read_process_logs(self) -> None:
         proc = self.process
         if proc is None or proc.stdout is None:
@@ -498,6 +995,11 @@ class DesktopAgentApp:
 
     def open_dashboard(self) -> None:
         url = self.dashboard_url_var.get().strip() or "http://localhost:3000"
+        session_id = self.session_var.get().strip()
+        if session_id:
+            encoded = urllib.parse.quote(session_id, safe="")
+            separator = "&" if "?" in url else "?"
+            url = f"{url}{separator}session={encoded}"
         webbrowser.open(url)
 
     def drain_logs(self) -> None:
@@ -509,6 +1011,20 @@ class DesktopAgentApp:
                 break
             self.append_log(line)
             moved = True
+        while True:
+            try:
+                line = self.live_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.append_conversation(line)
+            moved = True
+        while True:
+            try:
+                status = self.live_status_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.live_status_var.set(status)
+            moved = True
         if moved and self.process is not None and self.process.poll() is None:
             self.status_var.set(f"Running (PID {self.process.pid})")
         elif self.process is None or self.process.poll() is not None:
@@ -517,6 +1033,8 @@ class DesktopAgentApp:
 
     def on_close(self) -> None:
         self.persist_settings()
+        self.stop_live_view()
+        self.stop_helper_agent()
         self.stop_capture()
         self.root.destroy()
 
@@ -525,6 +1043,13 @@ class DesktopAgentApp:
 
 
 def main() -> None:
+    if "--helper-agent" in sys.argv:
+        try:
+            from helper.ui_agent import run as run_helper_agent
+        except ModuleNotFoundError:
+            from ui_agent import run as run_helper_agent  # type: ignore
+        run_helper_agent()
+        return
     if "--capture-worker" in sys.argv:
         idx = sys.argv.index("--capture-worker")
         worker_argv = sys.argv[idx + 1 :]
