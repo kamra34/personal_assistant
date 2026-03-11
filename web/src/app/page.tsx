@@ -19,6 +19,11 @@ type SessionSummary = {
   suggestion_count?: number;
 };
 
+type LiveSessionSummary = SessionSummary & {
+  socket_count?: number;
+  capture_socket_count?: number;
+};
+
 type TranscriptEvent = {
   type: "transcript";
   id?: number;
@@ -133,6 +138,7 @@ export default function HomePage() {
   const [errorText, setErrorText] = useState("");
 
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [liveSessions, setLiveSessions] = useState<LiveSessionSummary[]>([]);
   const [activeSessionId, setActiveSessionId] = useState("");
   const [events, setEvents] = useState<TimelineEvent[]>([]);
 
@@ -156,6 +162,8 @@ export default function HomePage() {
   const [captureRunning, setCaptureRunning] = useState(false);
   const [captureLogs, setCaptureLogs] = useState<string[]>([]);
   const [autoStopOnTabClose, setAutoStopOnTabClose] = useState(true);
+  const [sessionFromUrl, setSessionFromUrl] = useState("");
+  const [urlSessionApplied, setUrlSessionApplied] = useState("");
 
   const latestSuggestion = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i -= 1) {
@@ -209,12 +217,29 @@ export default function HomePage() {
       const data = await readJson<{ items: SessionSummary[] }>("/api/sessions");
       setSessions(data.items);
       if (!activeSessionId && data.items.length > 0) {
-        setActiveSessionId(data.items[0].id);
+        const hasUrlSession = Boolean(
+          sessionFromUrl && data.items.some((item) => item.id === sessionFromUrl)
+        );
+        const nextId = hasUrlSession ? sessionFromUrl : data.items[0].id;
+        setActiveSessionId(nextId);
+        if (hasUrlSession) {
+          setUrlSessionApplied(sessionFromUrl);
+          setStatusText(`Opened session from URL: ${sessionFromUrl}`);
+        }
       }
     } catch (err) {
       setErrorText(String(err));
     }
-  }, [activeSessionId]);
+  }, [activeSessionId, sessionFromUrl]);
+
+  const fetchLiveSessions = useCallback(async () => {
+    try {
+      const data = await readJson<{ items: LiveSessionSummary[] }>("/api/live-sessions");
+      setLiveSessions(data.items);
+    } catch (err) {
+      setErrorText(String(err));
+    }
+  }, []);
 
   const loadSession = useCallback(async (sessionId: string) => {
     try {
@@ -345,11 +370,13 @@ export default function HomePage() {
 
   useEffect(() => {
     void fetchSessions();
+    void fetchLiveSessions();
     const timer = setInterval(() => {
       void fetchSessions();
+      void fetchLiveSessions();
     }, 8000);
     return () => clearInterval(timer);
-  }, [fetchSessions]);
+  }, [fetchLiveSessions, fetchSessions]);
 
   useEffect(() => {
     void fetchAudioDevices();
@@ -386,6 +413,24 @@ export default function HomePage() {
     if (!activeSessionId) return;
     void loadSession(activeSessionId);
   }, [activeSessionId, loadSession]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    setSessionFromUrl((params.get("session") || "").trim());
+  }, []);
+
+  useEffect(() => {
+    if (!sessionFromUrl) return;
+    if (urlSessionApplied === sessionFromUrl) return;
+    const exists = sessions.some((item) => item.id === sessionFromUrl);
+    if (!exists) return;
+    if (activeSessionId !== sessionFromUrl) {
+      setActiveSessionId(sessionFromUrl);
+    }
+    setUrlSessionApplied(sessionFromUrl);
+    setStatusText(`Opened session from URL: ${sessionFromUrl}`);
+  }, [activeSessionId, sessionFromUrl, sessions, urlSessionApplied]);
 
   useEffect(() => {
     if (!activeSessionId) return;
@@ -484,6 +529,7 @@ export default function HomePage() {
         }),
       });
       await fetchSessions();
+      await fetchLiveSessions();
       setActiveSessionId(created.id);
     } catch (err) {
       setErrorText(String(err));
@@ -508,6 +554,7 @@ export default function HomePage() {
         wsRef.current.send(
           JSON.stringify({
             type: "configure",
+            client_role: "viewer",
             provider,
             model,
             context,
@@ -517,6 +564,29 @@ export default function HomePage() {
         );
       }
       await fetchSessions();
+      setErrorText("");
+    } catch (err) {
+      setErrorText(String(err));
+    }
+  };
+
+  const handleDeleteSession = async (sessionId: string) => {
+    const target = sessions.find((item) => item.id === sessionId);
+    const label = target?.title || sessionId;
+    if (!window.confirm(`Delete session "${label}"? This cannot be undone.`)) {
+      return;
+    }
+    try {
+      await readJson(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+        method: "DELETE",
+      });
+      if (activeSessionId === sessionId) {
+        setActiveSessionId("");
+        setEvents([]);
+      }
+      await fetchSessions();
+      await fetchLiveSessions();
+      setStatusText(`Deleted session: ${sessionId}`);
       setErrorText("");
     } catch (err) {
       setErrorText(String(err));
@@ -599,6 +669,42 @@ export default function HomePage() {
           </div>
 
           <div className="mt-4">
+            <div className="mb-4">
+              <div className="mb-2 flex items-center justify-between">
+                <h2 className="text-sm font-semibold">Live Sessions</h2>
+                <button
+                  className="rounded-md border border-slate-200 px-2 py-1 text-xs"
+                  onClick={() => void fetchLiveSessions()}
+                >
+                  Refresh
+                </button>
+              </div>
+              <div className="max-h-[22vh] space-y-2 overflow-auto pr-1">
+                {liveSessions.map((item) => (
+                  <button
+                    key={`live-${item.id}`}
+                    onClick={() => setActiveSessionId(item.id)}
+                    className={`w-full rounded-lg border px-3 py-2 text-left transition ${
+                      activeSessionId === item.id
+                        ? "border-teal-600 bg-teal-50"
+                        : "border-slate-200 bg-white hover:border-slate-300"
+                    }`}
+                  >
+                    <div className="truncate text-sm font-semibold">{item.title || "Untitled Session"}</div>
+                    <div className="mt-1 text-xs text-slate-600">
+                      capture: {item.capture_socket_count ?? 0} | sockets: {item.socket_count ?? 0} |{" "}
+                      {item.provider}/{item.model}
+                    </div>
+                    <div className="mt-1 truncate font-mono text-[11px] text-slate-500">{item.id}</div>
+                  </button>
+                ))}
+                {liveSessions.length === 0 && (
+                  <p className="rounded-lg border border-dashed border-slate-300 p-3 text-xs text-slate-500">
+                    No live sessions running.
+                  </p>
+                )}
+              </div>
+            </div>
             <div className="mb-2 flex items-center justify-between">
               <h2 className="text-sm font-semibold">Saved Sessions</h2>
               <button
@@ -610,24 +716,33 @@ export default function HomePage() {
             </div>
             <div className="max-h-[55vh] space-y-2 overflow-auto pr-1">
               {sessions.map((item) => (
-                <button
+                <div
                   key={item.id}
-                  onClick={() => setActiveSessionId(item.id)}
-                  className={`w-full rounded-lg border px-3 py-2 text-left transition ${
+                  className={`rounded-lg border px-3 py-2 transition ${
                     activeSessionId === item.id
                       ? "border-teal-600 bg-teal-50"
                       : "border-slate-200 bg-white hover:border-slate-300"
                   }`}
                 >
-                  <div className="truncate text-sm font-semibold">{item.title || "Untitled Session"}</div>
-                  <div className="mt-1 text-xs text-slate-600">
-                    {item.provider}/{item.model}
+                  <button className="w-full text-left" onClick={() => setActiveSessionId(item.id)}>
+                    <div className="truncate text-sm font-semibold">{item.title || "Untitled Session"}</div>
+                    <div className="mt-1 text-xs text-slate-600">
+                      {item.provider}/{item.model}
+                    </div>
+                    <div className="mt-1 truncate font-mono text-[11px] text-slate-500">{item.id}</div>
+                    <div className="mt-1 text-xs text-slate-500">
+                      {item.transcript_count ?? 0} transcript, {item.suggestion_count ?? 0} suggestions
+                    </div>
+                  </button>
+                  <div className="mt-2 flex justify-end">
+                    <button
+                      className="rounded border border-rose-300 px-2 py-1 text-[11px] text-rose-700 hover:bg-rose-50"
+                      onClick={() => void handleDeleteSession(item.id)}
+                    >
+                      Delete
+                    </button>
                   </div>
-                  <div className="mt-1 truncate font-mono text-[11px] text-slate-500">{item.id}</div>
-                  <div className="mt-1 text-xs text-slate-500">
-                    {item.transcript_count ?? 0} transcript, {item.suggestion_count ?? 0} suggestions
-                  </div>
-                </button>
+                </div>
               ))}
               {sessions.length === 0 && (
                 <p className="rounded-lg border border-dashed border-slate-300 p-3 text-xs text-slate-500">
@@ -725,7 +840,7 @@ export default function HomePage() {
                     <div className="mt-2 flex flex-wrap gap-2">
                       <a
                         className="rounded border border-slate-300 px-2 py-1 text-xs"
-                        href="/downloads/MeetingAssistantDesktopAgent-standalone.exe?v=20260309c"
+                        href="/downloads/MeetingAssistantDesktopAgent-standalone.exe?v=20260311c"
                         download
                       >
                         Download Windows .exe

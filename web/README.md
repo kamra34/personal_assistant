@@ -16,6 +16,7 @@ python helper\desktop_agent.py
 ```
 
 In Desktop Agent, set `OPENAI_API_KEY` in the app before starting capture if it is not already in your environment.
+Desktop Agent auto-starts the local Helper Agent so web-side Start/Stop capture controls can work at the same time.
 
 ## Required env
 

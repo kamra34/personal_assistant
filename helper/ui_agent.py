@@ -14,7 +14,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from helper.audio_devices import load_devices
+try:
+    from helper.audio_devices import load_devices
+except ModuleNotFoundError:
+    from audio_devices import load_devices  # type: ignore
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 
@@ -180,12 +183,7 @@ def run() -> None:
 
     host = os.getenv("HELPER_AGENT_HOST", "127.0.0.1")
     port = int(os.getenv("HELPER_AGENT_PORT", "8765"))
-    uvicorn.run(
-        "helper.ui_agent:app",
-        host=host,
-        port=port,
-        reload=False,
-    )
+    uvicorn.run(app, host=host, port=port, reload=False)
 
 
 if __name__ == "__main__":

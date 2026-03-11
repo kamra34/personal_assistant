@@ -21,12 +21,26 @@ Implemented:
 - Persistent sessions/transcripts/suggestions
 - Live websocket suggestion loop
 - Provider routing: `mock`, `openai`, `anthropic`
+- Upgraded local audio pipeline:
+  - adaptive VAD endpointing with pre-roll, min-start gate, hangover, and dynamic noise floor
+  - decoupled capture/VAD from STT sending (separate transcription queue) to reduce mid-sentence breaks under load
+  - automatic websocket reconnect/backoff after transient backend restarts (`1012 service restart`, transport drops)
+- Live session semantics:
+  - A session is `live` only when at least one capture client is connected (`client_role: "capture"`).
+  - Viewer/controller sockets do not mark a session live.
+- Safer deletion flow:
+  - `DELETE /api/sessions/{session_id}` closes live sockets first and uses a delete guard to avoid in-flight writes recreating deleted sessions.
 - Helper Agent HTTP API for device list + capture start/stop/status
 - Desktop Agent app (native UI) with:
+  - create session directly via backend API
+  - list/join live sessions and list/join/delete saved sessions
   - mic/system device selection
   - session/provider/model/history settings
   - local OpenAI key input for STT
   - optional local key/settings persistence
+  - open web dashboard on same session via query param deep-link
+  - auto-start local Helper Agent for web capture controls
+  - startup behavior: no auto session creation, no auto websocket connect; session starts only via explicit Create/Join
 
 Not implemented yet:
 - Auth/login
@@ -74,16 +88,25 @@ Run:
 ```powershell
 # Terminal A
 .venv\Scripts\Activate.ps1
-python -m backend.main
+.venv\Scripts\python -m uvicorn backend.main:app --reload
 
 # Terminal B
 cd web
 npm run dev
 
-# Terminal C (optional helper agent)
+# Terminal C (recommended desktop agent)
 .venv\Scripts\Activate.ps1
-python -m helper.ui_agent
+python helper\desktop_agent.py
 ```
+
+Alternative backend command:
+
+```powershell
+python -m backend.main
+```
+
+Desktop Agent auto-starts local Helper Agent in background for web capture controls.
+Desktop Agent does not auto-create or auto-join sessions on startup.
 
 ## 5) Ports And URLs
 
@@ -113,6 +136,7 @@ Frontend (`web/.env.local`):
   - Windows: `%APPDATA%\MeetingAssistant\desktop_agent.json`
   - Other OS: `~/.meeting_assistant_desktop_agent.json`
 - STT currently requires OpenAI key for local transcription when `STT_PROVIDER=openai`.
+- Live Sessions list should be interpreted as "capture active", not "any websocket open".
 
 ## 8) Current Architectural Constraint (Important)
 
@@ -142,3 +166,21 @@ If you add backend key storage:
    - keep local with remembered key
    - or move STT server-side for keyless local app
 5. Improve endpointing/VAD and transcript quality.
+
+## 11) Current Behavior Contracts (Do Not Break)
+
+- Session lifecycle:
+  - Creating a session must require explicit user action (`Create Session` or API `POST /api/sessions`).
+  - Opening Desktop Agent alone must not create DB sessions.
+- Live session rules:
+  - `/api/live-sessions` includes sessions with `capture_socket_count > 0` only.
+  - Web dashboard viewer connections alone must not make sessions appear live.
+- Delete rules:
+  - Deleting a session must remove it from saved sessions and live sessions immediately.
+  - Deleting during active capture must not recreate the same session via in-flight transcript writes.
+
+Key session APIs:
+- `GET /api/sessions`
+- `POST /api/sessions`
+- `DELETE /api/sessions/{session_id}`
+- `GET /api/live-sessions`
